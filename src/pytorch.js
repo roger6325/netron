@@ -449,30 +449,57 @@ pytorch.ModelFactory = class {
             };
 
             var root = unpickler.load(function_call, persistent_load);
+            if (!root) {
+                callback(new pytorch.Error("File format is not PyTorch in '" + identifier + "'."), null);
+            }
+
             var deserialized_storage_keys = unpickler.load();
             for (var key of deserialized_storage_keys) {
-                if (deserialized_objects[key]) {
-                    var storage = deserialized_objects[key];
+                var storage = deserialized_objects[key];
+                if (storage) {
                     storage.data = unpickler.read(storage.dataTypeSize * storage.size);
                 }
             }
 
-            if ((Array.isArray(root) && root.__setitem__ && root.every((item) => item.value.__type__.startsWith('torch.') && item.value.__type__.endsWith('Tensor'))) ||
-                (root != null && root.state_dict && Array.isArray(root.state_dict))) {
-                callback(new pytorch.Error("File does not contain a model graph. Use 'torch.save()' to save both the graph and tensor data."), null);
-                return;
+            var find_state_dict = function(dicts) {
+                for (var dict of dicts) {
+                    if (dict && Array.isArray(dict) && dict.__setitem__ &&
+                        dict.every((item) => item.key.indexOf('.') != -1 && item.value.__type__.startsWith('torch.') && item.value.__type__.endsWith('Tensor'))) {
+                        return dict;
+                    }
+                    if (dict && !Array.isArray(dict)) {
+                        var list = [];
+                        for (var key in dict) {
+                            var value = dict[key]
+                            if (!key || key.indexOf('.') == -1 || !value.__type__.startsWith('torch.') || !value.__type__.endsWith('Tensor')) {
+                                list = null;
+                                break;
+                            }
+                            list.push({ key: key, value: value });
+                        }
+                        if (list) {
+                            return list;
+                        }
+                    }
+                }
+                return null;
             }
 
-            if (!root._modules && !root.__type__ && root.model && root.model._modules) {
-                root = root.model;
+            var state_dict = find_state_dict([ root, root.model, root.state, root.state_dict, root.params, root.generator, root.discriminator ]);
+            if (state_dict) {
+                root = null;
+            }
+            else {
+                if (!root._modules && !root.__type__ && root.model && root.model._modules) {
+                    root = root.model;
+                }    
+                if (!root._modules) {
+                    callback(new pytorch.Error("Root object does not contain modules in '" + identifier + "'."), null);
+                    return;
+                }
             }
 
-            if (!root._modules) {
-                callback(new pytorch.Error("Root object does not contain modules in '" + identifier + "'."), null);
-                return;
-            }
-
-            var model = new pytorch.Model(metadata, sysInfo, root, module_source_map); 
+            var model = new pytorch.Model(metadata, sysInfo, root, state_dict, module_source_map); 
             callback(null, model);
         }
         catch (error) {
@@ -516,9 +543,9 @@ pytorch.ModelFactory = class {
 
 pytorch.Model = class { 
 
-    constructor(metadata, sysInfo, root, module_source_map) {
+    constructor(metadata, sysInfo, root, state_dict, module_source_map) {
         this._graphs = [];
-        this._graphs.push(new pytorch.Graph(metadata, sysInfo, root, module_source_map));
+        this._graphs.push(new pytorch.Graph(metadata, sysInfo, root, state_dict, module_source_map));
     }
 
     get format() {
@@ -532,21 +559,49 @@ pytorch.Model = class {
 
 pytorch.Graph = class {
 
-    constructor(metadata, sysInfo, root, module_source_map) {
+    constructor(metadata, sysInfo, root, state_dict, module_source_map) {
         this._metadata = metadata;
-        this._type = root.__type__;
+        this._type = root ? root.__type__ : '';
         this._nodes = [];
         this._inputs = [];
         this._outputs = [];
         this._groups = true;
         this._littleEndian = sysInfo.little_endian;
 
-        var input = 'data';
-        this._inputs.push(new pytorch.Argument(input, true, [ new pytorch.Connection(input, null, null) ]));
-
-        var outputs = this._loadModule(root, module_source_map, [], [ input ]);
-        for (var output of outputs) {
-            this._outputs.push(new pytorch.Argument(output, true, [ new pytorch.Connection(output, null, null) ]));
+        if (state_dict) {
+            var state_group_map = {};
+            var state_groups = [];
+            for (var state of state_dict) {
+                var key = state.key.split('.');
+                state.name = key.pop();
+                var id = key.join('.');
+                var state_group = state_group_map[id];
+                if (!state_group) {
+                    state_group = { id: id, states: [] };
+                    state_groups.push(state_group);
+                    state_group_map[id] = state_group;
+                }
+                state_group.states.push(state);
+            }
+            this._nodes = this._nodes.concat(state_groups.map((state_group) => {
+                var node = new pytorch.Node(metadata, state_group.id, { __type__: 'torch.nn.modules._.Weights' }, [], [], this._littleEndian);
+                node._inputs = state_group.states.map((state) => {
+                    return new pytorch.Argument(state.name, true, [ 
+                        new pytorch.Connection(state.key, null, new pytorch.Tensor(state.key, state.value, sysInfo.little_endian)) 
+                    ]);
+                });
+                node._outputs = [];
+                return node;
+            }));
+        }
+        else {
+            var input = 'data';
+            this._inputs.push(new pytorch.Argument(input, true, [ new pytorch.Connection(input, null, null) ]));
+    
+            var outputs = this._loadModule(root, module_source_map, [], [ input ]);
+            for (var output of outputs) {
+                this._outputs.push(new pytorch.Argument(output, true, [ new pytorch.Connection(output, null, null) ]));
+            }
         }
     }
 
@@ -676,12 +731,12 @@ pytorch.Node = class {
     constructor(metadata, key, obj, groups, connections, littleEndian) {
         this._metadata = metadata;
         this._group = groups.join('/');
-        this._name = this._group + '/' + key;
+        this._name = this._group ? (this._group + '/' + key) : key;
         var type = obj.__type__.split('.');
         this._operator = type.pop();
         this._package = type.join('.');
 
-        var inputs = [ { name: 'input '}];
+        var inputs = [ { name: 'input '} ];
         var schema = this._metadata.getSchema(this._operator);
         if (schema && schema.inputs && schema.inputs.length > 0) {
             inputs = schema.inputs.slice();
@@ -711,10 +766,10 @@ pytorch.Node = class {
             if (parameter && parameter.value && (parameter.value.data || parameter.value.storage)) {
                 var initializer = null;
                 if (parameter.value.data) {
-                    initializer = new pytorch.Tensor(parameter.value.data, littleEndian);
+                    initializer = new pytorch.Tensor('', parameter.value.data, littleEndian);
                 }
                 else if (parameter.value.storage) {
-                    initializer = new pytorch.Tensor(parameter.value, littleEndian);
+                    initializer = new pytorch.Tensor('', parameter.value, littleEndian);
                 }
                 this._inputs.push(new pytorch.Argument(inputName || parameter.key, visible, [ new pytorch.Connection('', null, initializer) ]));
             }
@@ -838,7 +893,8 @@ pytorch.Attribute = class {
 
 pytorch.Tensor = class {
 
-    constructor(tensor, littleEndian) {
+    constructor(name, tensor, littleEndian) {
+        this._name = name || '';
         this._tensor = tensor;
         this._type = new pytorch.TensorType(tensor.storage.dataType, new pytorch.TensorShape(tensor.size));
         this._littleEndian = littleEndian;
@@ -846,6 +902,10 @@ pytorch.Tensor = class {
 
     get kind() {
         return 'Tensor';
+    }
+
+    get name() {
+        return this._name;
     }
 
     get type() {
